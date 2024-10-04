@@ -1,0 +1,678 @@
+---
+title: "Covid-19 in Ireland"
+author: "John Mitchell"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message=FALSE,warning=FALSE)
+
+library(fpp3)
+library(calendR)
+library(urca)
+library(forecast)
+```
+
+
+# 1. Overview
+
+This report uses a global report of Covid-19 cases and deaths to investigate patterns in the data from Ireland (where I am originally from). It will explore:
+
+* What patterns emerge from the data - such as spikes in the number of cases, deaths, or both?
+* Can a simple predictive model be fitted to help predict future Covid-19 fatality rates?
+
+To investigate these questions:
+
+* **Section 2** imports, tidies, and summarizes the data. 
+* **Section 3** Conducts an Exploratory Data Analysis (EDA) - seeing what patterns emerge from time series plots and other visualizations.
+* **Section 4** Builds a model to predict weekly covid deaths from current and past data. The models fit - and its limitations - are discussed.
+* Then, **section 5** discusses potential sources of bias.
+* **Section 6** summarizes the conclusions.
+
+An appendix gives background information on Ireland and it's Covid-19 response, such as demographic information and a brief timeline of important events.
+
+References are linked to when first mentioned. The document uses "code folding": each code block can be shown or hidden using the "Show" button on the right side of the screen. The code for the entire document can be shown or hidden using the "code" button at the top.
+
+## 1.1 R Libraries Used 
+
+The **R libraries** used for this Report are:
+
+* `fpp3`: This is a package of time series prediction tools from the open-source book ["Forecasting, Principles, and Practice" or "fpp3"](https://otexts.com/fpp3/). This will also load standard packages such as `tidyverse`, as well as packages such as `fable` for forecasting. The [package documentation](https://www.rdocumentation.org/packages/fpp3/versions/1.0.1) has more details.
+* `calendR`: For generating *calendar heatmaps*, a visualization tool used in section 3.
+* `urca`: Has a statistical test used to assess the model built in section 4.
+* `forecast`: Has a search function to find the best model.
+
+If necessary, run 'install.packages("fpp3","calendR","urca", "forecast") to install these before knitting the document.
+
+# 2. Data Importing, Summarizing, and Tidying
+
+This section discusses the data source, and the process by which the data source is imported, summarized, and tidied. Only a small portion of the raw data - that dealing with Irish case reports - will be used, but the source contents will be discussed briefly for additional context.
+
+## 2.1 The Data Source and Extracting Irish Data
+
+The data source is an archive of data collected by the Johns-Hopkins Center for Systems Science and Engineering (CSSE) located [here](https://github.com/CSSEGISandData/COVID-19). The repository also contains details of the data sources. 
+
+The "global" data files contain daily reports of cumulative confirmed cases and fatalities up to that date . A "Country" field in the data identifies which country the daily totals are from. Some countries report totals at the province or state level, and a field is provided to specify which region the report pertains to. In Ireland's case, the daily totals reported are for the entire country. 
+
+The code in the section below - hidden by default - imports the global Covid-19 data set, and merges it with population data from another file in the repository.
+
+From this large data set - over 330,000 rows - the 1105 rows that pertain to Ireland are extracted. Three variables are of interest: the *date* of the report, the *cases* and *deaths*. These are used to build three data sets:
+
+* Cumulative daily reported Covid cases and deaths.
+* Daily reported new cases and deaths.
+* Weekly tallies of new cases and fatalities.
+
+The dates for which cases and deaths were reported range from February 29, 2020 to March 09, 2023.
+
+```{r covid_data_import}
+
+# Import global cases and global deaths
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names <- c("time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_global.csv")
+urls <- str_c(url_in,file_names)
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+
+# Using Pivot_longer to expand by date. Also removing lat and long.
+
+global_cases <- global_cases %>%
+    pivot_longer(cols=-c(`Province/State`,`Country/Region`,Lat,Long),
+                 names_to = "date",values_to="cases") %>%
+    select(-c(Lat,Long))
+
+global_deaths <- global_deaths %>%
+    pivot_longer(cols=-c(`Province/State`,`Country/Region`,Lat,Long),
+                 names_to = "date",values_to="deaths") %>%
+    select(-c(Lat,Long))
+
+global <- global_cases %>%
+    full_join(global_deaths) %>%
+    rename(Country_Region=`Country/Region`,
+           Province_State=`Province/State`) %>%
+    mutate(date=mdy(date))
+
+global <- global %>% dplyr::filter(cases>0)
+
+
+# To do any comparative analysis, populations are needed.
+# the world data set. To join with another, data set containing population, it
+# will help to have a field called "Combined_key" that pulls together
+# the Province_State and Country_Region. This will be used as the key for the join.
+global <-  global %>% unite("Combined_Key",
+                            c(Province_State,Country_Region),
+                            sep=", ",
+                            na.rm=TRUE,
+                            remove=FALSE)
+
+### This file has population for the countries
+uid_lookup_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+uid <- read_csv(uid_lookup_url) %>% select(-c(Lat,Long_,Combined_Key,code3,iso2,iso3,Admin2))
+
+### Now join both data frames.
+
+global <- global %>%
+    left_join(uid, by= c("Province_State","Country_Region")) %>%
+    select(-c(UID,FIPS))  %>%
+    select(Province_State,Country_Region,
+           date, cases, deaths, Population, Combined_Key)
+
+
+# Now filter out the Irish data. 
+ireland_raw <-  global %>% dplyr::filter(Country_Region=="Ireland")
+
+# The Ireland Data will be stored as "tsibble". A tsibble is an extension of a data frame that especially for time series. See the tsibble package documentation for more details.
+
+# Cumulative Cases and deaths
+ireland_daily_cumulative <- ireland_raw %>% select(date,cases, deaths) %>% mutate (date=ymd(date)) %>% as_tsibble(index=date)
+
+# Data Cases and Deaths
+ireland_daily <- ireland_raw %>% select(date,cases,deaths) %>%
+    mutate (date=ymd(date)) %>% mutate(cases =c(0,diff(cases)),deaths =c(0,diff(deaths))) %>%
+    na.omit() %>% as_tsibble(index=date)
+
+# Weekly tallies of Cases and Deaths
+ireland_weekly <- ireland_raw %>% select(date,cases,deaths) %>%
+    mutate (date=ymd(date)) %>% mutate(cases =c(0,diff(cases)), deaths =c(0,diff(deaths))) %>%
+    na.omit() %>% mutate(date=ceiling_date(date,unit="week")) %>%
+    group_by(date)  %>%
+    summarize(
+        cases=sum(cases),
+        deaths=sum(deaths)
+    ) %>%
+    as_tsibble(index=date)
+
+```
+## 2.1 Data Summary and Missing Data
+
+A summary of the daily cases and deaths is below. As well as showing the start and end of the reporting period, it indicates that some of the dates may have *negative* values for cases and/or
+deaths. 
+
+```{r data_summary}
+
+summary(ireland_daily)
+
+```
+
+The specific dates on which negative values occur are below. Because they take on several different values, they are unlikely to be missing values. Additional context is necessary  to determine the cause of each negative value. In the absence of this, it is assumed that they are corrections to previous totals (for example, if a death previously reported as due to Covid was reclassified as due to other causes, or cases were inadvertently double-counted).
+
+```{r negative_values}
+
+ireland_daily %>% dplyr::filter(cases<0 | deaths < 0)
+
+```
+
+How can these negative values be handled? Options include:
+
+* Replace them with zeroes. However, this would make cumulative totals incorrect. 
+* Redistribute them to the appropriate day or days that each correction pertains to. However, this is not possible without additional information.
+* Leave them in the data set. This will ensure cumulative totals from the original raw data set are preserved, but will result in unrealistic daily totals for a small number of days.
+
+It was decided to use the third option. 
+
+The exploratory data analysis in the next section explores another form of missing value: days on which the case total is zero. This will be due to the frequency with which updated totals were reported. It will emerge that the schedule for updates changed several times.
+
+# 3 Exploratory Data Analysis
+
+This section explores what patterns can be observed in the data set, using time series plots of Covid-19 cases and deaths. The first section looks at cumlative totals.
+
+## 3.1 Cumulative cases and mortality rates  
+
+The plots - in the tabs below - show the total reported Covid-19 cases and deaths over the period from March 2020 to March 2023. 
+
+There were totals of `r format(as.integer(max(ireland_daily_cumulative$cases)),big.mark=",")` cases and `r max(ireland_daily_cumulative$deaths)` fatalities due to Covid-19 during this time period.
+
+### Plots of Cumulative Cases {.tabset}
+
+#### Total Cases
+
+```{r cumulative_daily}
+
+# autoplot is used as it can handle a time series plot of a tsibble
+autoplot(ireland_daily_cumulative,cases) +
+    labs(title="Ireland - Total Covid-19 Cases", subtitle="March 2020 - March 2023",x="date")
+
+```
+
+#### Total Deaths
+
+```{r cumulative_deaths}
+
+autoplot(ireland_daily_cumulative,deaths) +
+    labs(title="Ireland - Total Covid-19 Deaths", subtitle="March 2020 - March 2023",x="date")
+
+```
+
+### Observations:
+
+* The cases show periods of rapid increase: at the end of 2020, and - expecially - at the end of 2021 and beginning of 2022.
+
+* As for Covid-19 deaths, there are two clear periods where there is a rapid increase in the rate of mortalities - in Spring of 2021, and in the first few months of 2022.
+
+Both patterns are clearer in the plots in the next section, which use *new* cases and deaths rather than *totals*.
+
+## 3.2 Daily New Cases and Fatalities
+
+The plots in the tabs below show the daily totals reported of new Covid-19 cases and new deaths due to Covid-19 from March 2020 to March 2023. These totals were obtained by differencing the original data: subtracting the previous day's total from the current total.
+
+### Plots of Daily Cases {.tabset}
+#### New Cases
+```{r new_daily}
+
+autoplot(ireland_daily,cases) +
+    labs(title="Ireland - New Covid-19 Cases", subtitle="March 2020 - March 2023",x="date")
+
+```
+
+#### New Deaths
+```{r new_deaths}
+
+autoplot(ireland_daily,deaths) +
+    labs(title="Ireland - New Covid-19 Deaths", subtitle="March 2020 - March 2023",x="date")
+
+```
+
+### Observations
+
+* Starting in early 2022, the daily cases plot has many discontinuities. This is due to changes in how frequently new cases were reported: totals in 2022 and 2023 were not reported every day. Instead, aggregate totals were given of the new cases since the last reporting day. The precise schedule is explored using a "calendar heatmap" below. 
+
+* In the daily cases plot, a spike at the beginning of 2021, and an even larger spike at beginning of 2022. The timeline of Covid-19 events in Ireland (in Appendix A) confirms that these spikes occurred, and suggests potential causes: the first spike was after the 2020 holidays, and the second spike was due to the arrival of the Omicron Covid-19 variant.
+
+* As for Covid-19 deaths, a large increase is observed shortly after the start of the pandemic, and a second increase at the beginning of 2021 - after the spike in cases. Interestingly, the arrival of Omicron variant does not seem to have caused a dramatic spike in deaths. The rate of deaths may be elevated, but this could also be due to the data being aggregregate totals for more than one day.
+
+* The occasional negative value is likely a correction to previous totals, as noted in section 2.
+
+A set of calendar heatmaps below show the dates (in blue) for which at least one case was reported.
+
+### Reporting of Daily Rates {.tabset}
+
+#### 2020
+
+```{r 2020_cal,out.width='100%'}
+
+
+report_year="2020"
+# create a vector of days with cases reported to color in on the heatmap
+report_days <-  ireland_daily %>% dplyr::filter(year(date)==report_year) %>%
+    dplyr::filter(cases>0) %>% mutate(date=yday(date)) %>% select(date)
+
+# use the calendR function to create a heat make
+calendR(year = report_year,           # Year
+        low.col = "#FFFFED",          # color scheme 
+        special.col = "lightblue",
+        weeknames = c("M", "Tu",      # Week names
+                      "W", "Th",
+                      "F", "Sa",
+                      "Su"),
+        orientation="landscape",
+        special.days = report_days$date,  # The days to color in
+        months.pos = 0.5)            # Horizontal alignment of the month names
+
+```
+
+
+#### 2021
+
+```{r 2021_cal,out.width='100%'}
+
+# calendR(year = 2021,
+#         special.days = data,
+#         gradient = TRUE,
+#         text.size = 4,
+#         low.col = "#FFFFED",
+#         special.col = "#FF0000",
+#         weeknames = c("M", "Tu",  # Week names
+#                       "W", "Th",
+#                       "F", "Sa",
+#                       "Su"),
+#         orientation="landscape")
+
+report_year="2021"
+report_days <-  ireland_daily %>% dplyr::filter(year(date)==report_year) %>%
+    dplyr::filter(cases>0) %>% mutate(date=yday(date)) %>% select(date)
+
+calendR(year = report_year,           # Year
+        low.col = "#FFFFED",
+        special.col = "lightblue",
+        weeknames = c("M", "Tu",  # Week names
+                      "W", "Th",
+                      "F", "Sa",
+                      "Su"),
+        orientation="landscape",
+        special.days = report_days$date,
+        months.pos = 0.5)     # Horizontal alignment of the month names
+
+# Old version
+# calendR(year = report_year,           # Year
+#         mbg.col = 2,           # Background color for the month names
+#         months.col = "white",  # Text color of the month names
+#         special.days = report_days$date,
+#         special.col = "pink", # Color of the special.days
+#         months.pos = 0.5)     # Horizontal alignment of the month names
+
+
+```
+
+
+#### 2022
+
+```{r 2022_cal,out.width='100%'}
+
+report_year="2022"
+report_days <-  ireland_daily %>% dplyr::filter(year(date)==report_year) %>%
+    dplyr::filter(cases>0) %>% mutate(date=yday(date)) %>% select(date)
+
+# Calendar
+calendR(year = report_year,           # Year
+        low.col = "#FFFFED",
+        special.col = "lightblue",
+        weeknames = c("M", "Tu",  # Week names
+                      "W", "Th",
+                      "F", "Sa",
+                      "Su"),
+        orientation="landscape",
+        special.days = report_days$date,
+        months.pos = 0.5)     # Horizontal alignment of the month names
+
+```
+
+
+#### 2023
+
+```{r 2023_cal,out.width='100%'}
+
+report_year="2023"
+report_days <-  ireland_daily %>% dplyr::filter(year(date)==report_year) %>%
+    dplyr::filter(cases>0) %>% mutate(date=yday(date)) %>% select(date)
+
+# Calendar
+calendR(year = report_year,           # Year
+        low.col = "#FFFFED",
+        special.col = "lightblue",
+        weeknames = c("M", "Tu",  # Week names
+                      "W", "Th",
+                      "F", "Sa",
+                      "Su"),
+        orientation="landscape",
+        special.days = report_days$date,
+        months.pos = 0.5)     # Horizontal alignment of the month names
+
+```
+
+### Observations
+
+It appears that the schedule for Covid-19 updates changed several times. For 2020 and 2021, totals were updated daily (with a few exceptions). For the first few months of 2022, reporting was (mostly) done on weekdays. Then, for the rest of 2022 and 2023, updates were given on Wednesdays.
+
+## 3.3 Weekly Data
+
+Because of the extensive gaps in daily data, *weekly* data will be used for modeling. Weekly data was obtained from the original data by aggregating daily totals - see the code in section 2 for details.
+
+The weekly data just had one missing value - over the holidays of 2022. To adjust for this, the total for the following week - which was for a two week period - was split evenly between the two dates.
+
+### Plots of Weekly Data {.tabset}
+
+#### New Cases
+```{r new_weekly}
+
+autoplot(ireland_weekly,cases) +
+    labs(title="Ireland - New Covid-19 Cases Weekly", subtitle="March 2020 - March 2023",x="date")
+
+
+```
+
+#### New Deaths
+```{r new_weekly_deaths}
+
+autoplot(ireland_weekly,deaths) +
+    labs(title="Ireland -New Covid-19 Deaths Weekly", subtitle="March 2020 - March 2023",x="date")
+```
+
+### Observations
+
+As well as smoothing out the data, the weekly tallies correct the issue that many of the daily totals were for more than one day. Now each total is for one week of new cases. 
+
+As well as the features identified in previous sections (such as the spikes in cases), the plot of Covid-19 deaths may show some cyclical behavior over each year, with a dip in the middle of the year and an increase in the new year. However, a longer time period is needed to explore this further.
+
+The next section explores fitting a model to the weekly Covid-19 deaths, and evaluating its use for prediction.
+
+# 4. Modeling Weekly Covid-19 Death Rates
+
+In this section the Ireland weekly Covid-19 deaths are used to build a model. The following sections detail: model selection; an overview of the chosen model, fitting the model, and evaluating the fit.
+
+In summary:
+
+* The data is split into a training set (from 2020 to 2022) and a test set (from the beginning of 2023). The training set is used to fit the model, and it is evaluated on the test set.
+* An Autoregressive Integrated Moving Average (ARIMA) model is chosen after exploring several options, It has three parameters for which appropriate values must be determined. The values are determined using an automated method.
+* The resulting model is assessed and found to pass diagnostic tests for suitability, and the test data is within bounds of the models prediction intervals. 
+* Given its simplicity and relatively good fit, the model is seen as a useful first step. However, much more would be needed to predict sudden spikes due to new variants or other factors. 
+
+## 4.1. Model Selection
+
+There are a wide range of potential models to choose from (see for example, this [review](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10631421/#:~:text=Time%20series%20analysis%20is%20a,not%20have%20a%20causative%20role.) of approaches to Covid-19 modeling. 
+
+Among *univariate* models - using current and previous values of the time series to predict future values, the most commonly used "classical" mathematical models include *ARIMA* and *exponential smoothing*. Machine Learning algorithms include *prophet*, *Random Forest*, among many others. The [modeltime](https://business-science.github.io/modeltime/) package in R can be used explore many of these options.
+
+After initial investigation of several models using the `modeltime` packages - specifically ARIMA, exponential smoothing, and prophet - it was decided that ARIMA had the most potential.
+
+Reasons include:
+
+* The data set passes many of the preliminary tests for ARIMA suitability - see the next section for details.
+* The model is a classic, widely used model for time series prediction that has been extensively studied.
+* The process for parameter tuning is well understood, and there is an automated function in R for finding optimal parameters.
+
+## 4.2 The ARIMA Model
+
+A brief outline of the the ARIMA model will be given here that may be skipped for those familiar with it. Full details, including the fitting and evaluation process, and R code can be found in [fpp3](https://otexts.com/fpp3/arima.html) chapter 9.
+
+The (**ARIMA**) model has three components. **AR** (AutoRegressive), **I** (integrated), and **M** (Moving Average). Each of them is controlled by an integer parameter denoted by $p$, $d$, and $q$ respectively.
+
+The value of $d$ - corresponding to the **I** in **ARIMA** - is determined first: the time series must be *stationary* before proceeding, that is, the expected value of the series must not be changing over time. If it fails this condition, the time series is *differenced* - that is, successive values subtracted (creating a new series $y_t=x_t-x_{t-1}$), and again checked for stationarity. This is repeated as needed (or until it is clear the method has failed) The number of times this is applied is the parameter $d$. If $d=0$ - that is, nodifferencing is needed - the model can also be called an **ARMA** model, with just **AR** and **MA** components. 
+
+The **AR** portion of the model uses linear combinations of previous *values*. Thus $AR(p)$ model is given by:
+
+$$x_t=c +\phi_{1}x_{t-1} +\phi_{2}x_{t-2}+\cdots+\phi_{p}x_{t-p} +\varepsilon_t$$
+where $x_t$ is the current value, $x_{t-1} \cdots x_{t-p}$ are the $p$ previous or *lagged* values, $c$ is the overall mean of the series, and $\varepsilon_t$ is a noise or error term (assumed to be normal and of constant variance over time). The parameters $\phi_{1}, \cdots ,\phi_{p}$ are determined using *Maximum Likelhood Estimation* (MLE).
+
+The **ARMA** model combines the **AR** model with a **MA** moving average model, so that in addition to incorporating previous values of the *observations*, previous values of the *error terms* are used. That is, an $ARMA(p,q)$ model has the form:
+
+$$x_t=c +\phi_{1}x_{t-1} +\phi_{2}x_{t-2}+\cdots+\phi_{p}x_{t-p} + \theta_1\varepsilon_{t-1}+\theta_2\varepsilon_{t-2}+\cdots +\theta_q\varepsilon_{t-q} +\varepsilon_t $$
+where $\theta_{1}, \cdots ,\theta_{q}$ are parameters to be determined.  
+
+Thus, the fitted ARIMA model has values of the three parameters determined. For example, an $ARIMA(3,1,1)$ has $p=3,d=1,q=1$. 
+How are the parameters of "best fit" determined? A measure of fit such as Akaike's Information Criterion (AIC) can be used, and the model chosen that minimizes it. `R` has a function - `auto.arima` - to automate the search for the optimal set of parameter values.
+
+## 4.3 Model fitting and Evaluation
+
+We begin by testing the weekly Covid-19 fatalities for stationarity. The first check is visually inspecting the plot from section 3.3 for any overall trend that would suggest that the mean is not constant over time. It can be seen that although there are large spikes, there does not seem to be any substantial trend.
+
+A statistical test can also be applied - such as the *KPSS* test (see [fpp3](https://otexts.com/fpp3/stationarity.html) for details). The null hypothesis is that the data is stationary, and therefore a high p-value gives further evidence that the data is stationary, or sufficiently close that no differencing needs to be applied.
+
+The KPPS Test output is in the tab below. The p-value is 0.1815, and thus no differencing needs to be applied.
+
+Another item to check for in the time series plot is the assumption of *constant variance* over time. If this were violated, a data transformation (such as a log transformation) might be explored. This does not appear to be needed in this case.
+
+For exploring where there are **AR** or **MA** components, The  *autocorrelation* plot and *partial autocorrelation* plots are useful. Both are in tabs below. On each, there are dotted horizontal lines that give a rough cut off of significance.
+
+The autocorrelation shows that the previous four lagged values appear to have higher correlations with the current value, though it does not tell us specifically whether this is due to the value itself or the error term. More specifically, the partial autocorrelation shows that the previous value is important, suggesting that $p=1$ may be appropriate.
+
+### Tests and Visualizations prior to Fitting {.tabset}
+
+#### KPSS Test
+
+```{r kpss}
+
+ireland_weekly$deaths %>% ur.kpss() %>% summary()
+```
+
+#### Autocorrelation
+
+```{r autocorrelation}
+
+acf(ireland_weekly$deaths)
+
+```
+
+#### Partial Autocorrelation
+
+```{r partial_autocorrelation}
+
+pacf(ireland_weekly$deaths)
+
+```
+
+
+### Fitting and Checking Residuals {.tabset}
+
+Now let's fit the model. The data from 2020 to 2022 will be used as training data, and the remaining data - from the first 11 weeks of 2023 - will be used as test data.
+
+The "Model Fit" tab below shows the output of `auto.arima'. The best model found - in the sense of minimizing the AIC - is the $ARIMA(1,0,3)$ model.
+
+Having fitted the model,the residuals chould be checked (see the tab below). The residual plot (at the top) should be centered at zero, the autocorrelation (on the left) should not have significant lagged values, and the distribution of residuals (at the bottom right) should be roughly normal. The output of a formal test - the Lyung-Box test - is also shown. This tests that the residuals are independent and identically distributed. A high p-value (and in this case it is 0.95 - very high) supports this value.
+
+The diagnostics do not suggest any issues with the $ARIMA(1,0,3)$ model, so we can move to using it for prediction.
+
+#### Model Fit
+
+```{r auto_arima}
+
+# Split the data
+ireland_train <- ireland_weekly %>% dplyr::filter(year(date)<"2023")
+ireland_test <- ireland_weekly %>% dplyr::filter(year(date)=="2023")
+
+
+# Setting stepwise=FALSE and approximation=FALSE runs more slowly, but
+# is more accurate. The information measure to minimize is set to AIC.
+auto.arima(ireland_train$deaths,stepwise=FALSE,approximation=FALSE,ic="aic")
+
+```
+
+
+#### Residual Check
+
+```{r residuals}
+
+# Save the model, and check the residuals
+ireland_model  <-  auto.arima(ireland_train$deaths,stepwise=FALSE,approximation=FALSE,ic="aic")
+
+checkresiduals(ireland_model)
+
+```
+
+
+## 4.4 Using the Model for Prediction
+
+The plots - in the tabs below - show the model being used for prediction. 
+
+* The first plot shows the predicted mean, as well as 80% and 95% prediction intervals (in light and dark blue). The model predicts a slight rise in average cases over the 11 weeks. 
+
+* The second plot shows the model fit - in red - to the training data. The model captures some of the structural aspects of the training data quite well, including tracking the peak periods.
+
+* The final plot shows that that the test data (in red) for early 2023 is within the model prediction intervals. 
+
+The model appears to have worked quite well as a first attempt at prediction. However, there are many caveats, including:
+
+* The model would need to be tracked over time, refitted and reassessed.
+* The model has no seasonal component. If the data appears to show seasonality over time, an extension such as SARIMA (seasonal ARIMA) should be explored.
+* The model might work adequately for ballpark estimates during stable periods where there is no major changes in conditions - such as the emergence of a new variant. However it would need to be much more sophisticated to adapt to such changes. The review referenced at the start of section 4.1 discusses such models.
+
+
+### Plots of prediction {.tabset}
+
+#### Prediction 
+```{r prediction}
+
+# In the plot the time is given in weeks as the forecast function doesn't seem to interpret the date field correctly.
+ireland_model %>%
+    forecast(h=11) %>%
+    autoplot(main="Training Data fit to Model",ylab="Covid-19 Deaths",xlab = "Time (in weeks)", showgap=FALSE)
+
+
+```
+
+#### With Training Set
+```{r prediction_train}
+
+
+
+# In the plot the time is given in weeks as the forecast function doesn't seem to interpret the date field correctly.
+
+ireland_model %>% forecast(h=11) %>%
+    autoplot(main="Training Data fit to Model",ylab="Covid-19 Deaths",showgap=FALSE) +
+  autolayer(fitted(ireland_model,h=1)) +
+    guides(col="none")
+
+```
+
+
+#### With Test Set
+
+```{r prediction_and_train}
+
+
+# Note: The test set could not be superimposed on the plot as a "tsibble". In this section the data is converted to the "ts" format in base R. This is messier as the "ts" plot needs to do a messy calculation for the dates. But once set up, it does show on the x axis of the plot.
+
+ireland_ts <- ts(ireland_weekly$deaths, start=decimal_date(ymd(first(ireland_weekly$date))),frequency=365.25/7)
+
+ireland_train_ts <- head(ireland_ts,148)
+ireland_test_ts <- tail(ireland_ts,11)
+
+# Fit model
+fit_arima <- auto.arima(ireland_train_ts, ic = "aic")
+
+# Compute forecasts
+fcst <- forecast(fit_arima, h = 11)
+
+# Plot forecasts and test set
+autoplot(fcst,showgap=FALSE,main="Training Data fit to Model",ylab="Covid-19 Deaths") + autolayer(ireland_test_ts) + guides(col="none")
+
+```
+
+# 5. Potential Sources of Bias 
+
+
+
+There are several potential sources of bias in the data, including:
+
+* Nonresponse bias due to undetected cases. The reported cases are only those who tested positive and reported it to the health care authorities. It's likely a large - but unknown - proportion of cases were either never detected or never reported.
+* Inequitable access to health care is likely a source of bias in the data. Vulnerable populations - such as the unhoused - are likely underrepresented in the detection of cases.
+* Similarly, inequities in health care access is potentially a cause of excess mortalities. 
+
+Having no demographic information as part of this data set makes exploring the effect of these biases - or others - impossible. It is hoped that detailed Irish studies that had access to this information were able to draw useful lessons from it to - for example - reduce biases in health care access.
+
+I should also mention a personal bias: an emotional attachment to the country being studied in this report. Ireland is where I was born. I watched my family struggle through the pandemic from afar, and didn't get to visit them until the Fall of 2021. In the meantime, several elderly relatives had passed away from Covid-19. Studying this data set has brought up many painful memories - as I'm sure it does for anyone who studies this difficult period in recent history.
+
+# 6. Conclusions
+
+In the Exploratory Data Analysis several dramatic spikes in the rate of new Covid-19 Cases, Covid-19 deaths, or both were observed. By far the largest spike in cases was at the end of 2021, with the arrival of the Omicron variant of the virus - though it was not followed by an equally dramatic increase in deaths.
+
+The weekly data was found to be a good candidate for an ARIMA model. The model was fitted to a training set consisting of the 2020-2022 data, and performed quite well on the test data from 2023. However, the model should be viewed as a starting point, as it lacks the sophistication to factor in new variants or other changes in the underlying conditions.
+
+Thank you for taking the time to read this report - I hope it was interesting and informative. Feedback is very welcome through the CU peer review process for the course, or if you want to reach out to me in person, my email is `john.mitchell@colorado.edu`.
+
+# References on Time Series
+
+Good textbooks are [Time Series](https://www.routledge.com/Time-Series-A-Data-Analysis-Approach-Using-R/Shumway-Stoffer/p/book/9780367221096?srsltid=AfmBOorRm69Cq8kV4_kYavIa0ggLdt4rAYBN61SlgGgJGd88Ft1gFfKy), and the open-source book [Forecasting Principles and Practice, 3rd ed.](https://otexts.com/fpp3/), often abbreviated to "fpp3". Both have a chapter on ARIMA. 
+
+For a brief introduction, a useful resource is the [Little Book of R for Time Series](https://a-little-book-of-r-for-time-series.readthedocs.io/en/latest/).
+
+The [modeltime](https://business-science.github.io/modeltime/) package in R supports Machine Learning models as well as more traditional mathematical models, and has an interface to set up and compare different models on the same data.
+
+# Appendix A: Ireland Demographics and Covid-19 Response
+
+This section has some additional context on Ireland and its response to Covid-19. For this section, ChatGPT was used as a research tool to research demographic information about Ireland, and to create an draft list of key events in Ireland's Covid-19 response.
+
+## A.1 Demographics 
+
+The "Ireland" discussed in this report is short for the nation of the "Republic of Ireland". The "Republic of Ireland" consists of most of the landmass of Ireland, an on the western edge of Europe. However, a portion of the island - "Northern Ireland" - is part of Britain, and its Covid-19 data is not part of this study. It would be a fascinating follow-up study to compare how the two regions - on the same island, but with different governing bodies - fared in terms of Covid-19 cases and fatalities.
+
+The Republic of Ireland has a population of about 5 million, and is part of the European Union (EU). The Covid-19 reponse was coordinated by the Health Service Executive (HSE), which manages Irelands public health care system. The country has universal public health care, as well as private options.
+
+The centrally coordinated response attempted to limit the spread of Covid 19 through movement restrictions, mask mandates, and - of course - vaccination drives. A timeline of key events is given in the next section. 
+
+In comparison to the Covid Response in the U.S, notable differences include:
+
+* A centrally coordinated response, rather than (as in the US) regional policies set by states.
+* Several periods where not only were schools and business closed - as in the U.S. - but movement was severely restricted - limiting movement to within a few miles of home. 
+* While there was less vaccine hesitancy than in the U.S, the supply of vaccines was a problem at times. As of now - October 2024 - overall percentages of those vaccinated at least once are similar (US: 81.8%, ireland 83.2%). (The source for these percentages is [Johns Hopkins Coronavirus Resource Center](https://coronavirus.jhu.edu/vaccines/international)).
+
+
+## A.2 Timeline of Covid-19
+
+Below are some highlights of the progression of Covid-19 in Ireland.
+
+### 2020
+- **January 2020**: First confirmed case of Covid-19 in Ireland; a traveler returning from Italy.
+- **March 2020**: Government announces first lockdown; schools, pubs, and non-essential businesses close.
+- **April 2020**: Peak of cases and deaths; introduction of stringent movement restrictions - allowing only essential work, grocery shopping, medical visits, and exercise within 2km of home.
+- **May 2020**: Gradual easing of restrictions begins; Phase 1 of reopening announced.
+- **December 2020**: Arrival of the first Covid-19 vaccines in Ireland; rollout begins for healthcare workers.
+
+### 2021
+- **January 2021**: Significant spike in cases; government reintroduces movement limits: restricting travel to within 5km of home.
+- **February 2021**: New variants (including Alpha variant) detected; increased concerns about transmissibility.
+- **March 2021**: Vaccination program expands; priority given to older adults and at-risk groups.
+- **June 2021**: Continued easing of restrictions as vaccination rates increase; hospitality sector begins to reopen.
+- **December 2021**: Emergence of the Omicron variant.
+
+### 2022
+- **January 2022**: Record high daily cases due to Omicron; reintroduction of mask mandates and other restrictions.
+- **February 2022**: Most Covid-19 restrictions lifted, including capacity limits and social distancing rules.
+- **March 2022**: End of mandatory isolation for positive cases; emphasis on personal responsibility.
+- **August 2022**: Surge in cases reported; health officials advise caution and increased vaccinations.
+- **November 2022**: New variant of concern (BQ.1) detected; calls for booster vaccinations.
+
+### 2023
+- **January 2023**: Cases rise slightly after the holiday season; authorities encourage booster uptake.
+- **April 2023**: Most remaining restrictions lifted; focus shifts to managing Covid-19 as an endemic virus.
+
+
+
+ 
+
+
+
